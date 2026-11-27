@@ -9,7 +9,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.wifi.WifiManager
-import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
@@ -56,14 +55,10 @@ class StreamKeepAliveService : Service() {
         runCatching {
             if (wifiLock == null) {
                 val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-                val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-                } else {
-                    @Suppress("DEPRECATION")
-                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
-                }
-                wifiLock = wm?.createWifiLock(mode, "ProjectX::StreamWifiLock")
-                    ?.apply { setReferenceCounted(false) }
+                wifiLock = wm?.createWifiLock(
+                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY,
+                    "ProjectX::StreamWifiLock"
+                )?.apply { setReferenceCounted(false) }
             }
             if (wifiLock?.isHeld == false) {
                 wifiLock?.acquire()

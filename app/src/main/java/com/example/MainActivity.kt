@@ -1,5 +1,6 @@
 package com.example
 
+import android.annotation.SuppressLint
 import android.content.ComponentCallbacks2
 import android.os.Bundle
 import android.view.KeyEvent
@@ -187,6 +188,7 @@ class MainActivity : ComponentActivity() {
         return super.dispatchGenericMotionEvent(ev)
     }
 
+    @SuppressLint("RestrictedApi")
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (viewModel.uiState.value.isStreaming && viewModel.onPhysicalKeyEvent(event)) {
             return true
