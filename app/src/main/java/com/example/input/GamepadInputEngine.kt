@@ -92,21 +92,34 @@ class GamepadInputEngine(context: Context) {
             reportPhysical: Boolean = true
         ): ByteArray {
             val buf = ByteBuffer.allocate(BINARY_FRAME_SIZE).order(ByteOrder.LITTLE_ENDIAN)
-            buf.putShort(REPORT_TYPE_GAMEPAD)
-            buf.putInt(sequence)
-            buf.putDouble(timestampMs)
-            buf.put(1.toByte()) // gamepadCount = 1
-            buf.put(0.toByte()) // gamepadIndex = 0
-            buf.putShort(mapToXboxCloudButtonMask(state.buttonsMask))
-            buf.putShort(floatAxisToShort(state.leftStickX))
-            buf.putShort(floatAxisToShort(-state.leftStickY))
-            buf.putShort(floatAxisToShort(state.rightStickX))
-            buf.putShort(floatAxisToShort(-state.rightStickY))
-            buf.putShort(floatTriggerToUShort(state.leftTrigger))
-            buf.putShort(floatTriggerToUShort(state.rightTrigger))
-            buf.putInt(if (reportPhysical) PHYSICALITY_ALL_STANDARD else 0)
-            buf.putInt(if (reportPhysical) 0 else PHYSICALITY_ALL_STANDARD)
+            encodeBinaryFrameInto(buf, state, sequence, timestampMs, reportPhysical)
             return buf.array()
+        }
+
+        fun encodeBinaryFrameInto(
+            target: ByteBuffer,
+            state: GamepadState,
+            sequence: Int,
+            timestampMs: Double = if (state.timestampMs > 0L) state.timestampMs.toDouble() else System.currentTimeMillis().toDouble(),
+            reportPhysical: Boolean = true
+        ) {
+            target.clear()
+            target.order(ByteOrder.LITTLE_ENDIAN)
+            target.putShort(REPORT_TYPE_GAMEPAD)
+            target.putInt(sequence)
+            target.putDouble(timestampMs)
+            target.put(1.toByte()) // gamepadCount = 1
+            target.put(0.toByte()) // gamepadIndex = 0
+            target.putShort(mapToXboxCloudButtonMask(state.buttonsMask))
+            target.putShort(floatAxisToShort(state.leftStickX))
+            target.putShort(floatAxisToShort(-state.leftStickY))
+            target.putShort(floatAxisToShort(state.rightStickX))
+            target.putShort(floatAxisToShort(-state.rightStickY))
+            target.putShort(floatTriggerToUShort(state.leftTrigger))
+            target.putShort(floatTriggerToUShort(state.rightTrigger))
+            target.putInt(if (reportPhysical) PHYSICALITY_ALL_STANDARD else 0)
+            target.putInt(if (reportPhysical) 0 else PHYSICALITY_ALL_STANDARD)
+            target.flip()
         }
 
         fun isServerMetadataPacket(data: ByteArray): Boolean {

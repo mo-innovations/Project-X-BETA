@@ -1,5 +1,6 @@
 package com.example.network
 
+import android.content.ComponentCallbacks2
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -45,6 +46,20 @@ object XboxImageCache {
     }
 
     fun memoryLookup(key: String): ImageBitmap? = memoryCache.get(key)
+
+    fun clearMemoryCache() {
+        memoryCache.evictAll()
+    }
+
+    fun trimMemory(level: Int) {
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND) {
+            memoryCache.evictAll()
+        } else if (level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
+            memoryCache.trimToSize(memoryCache.maxSize() / 4)
+        } else {
+            memoryCache.trimToSize(memoryCache.maxSize() / 2)
+        }
+    }
 
     suspend fun loadOrFetchSmall(
         context: Context,

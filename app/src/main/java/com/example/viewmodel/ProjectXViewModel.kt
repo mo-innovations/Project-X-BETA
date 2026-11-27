@@ -38,6 +38,7 @@ import com.example.network.WakeOnLanSender
 import com.example.network.XHomeSignalingClient
 import com.example.network.XboxAuthRepository
 import com.example.network.XboxImageCache
+import com.example.service.StreamKeepAliveService
 import com.example.webrtc.XHomeWebRtcEngine
 import org.webrtc.SurfaceViewRenderer
 import kotlinx.coroutines.isActive
@@ -1035,6 +1036,8 @@ class ProjectXViewModel(application: Application) : AndroidViewModel(application
                                 )
                             }
                             syncAmbientMusic()
+                            XboxImageCache.clearMemoryCache()
+                            StreamKeepAliveService.start(getApplication(), console?.name ?: "Xbox Console")
                             startKeepaliveLoop(gsToken, sessionInfo.sessionPath, sessionInfo.effectiveBaseUrl)
                             appendLog("WebRTC", "Greenlight stream connected (${console?.name ?: "Xbox"})", LogSeverity.SUCCESS)
                             return@launch
@@ -1077,11 +1080,14 @@ class ProjectXViewModel(application: Application) : AndroidViewModel(application
                         )
                     }
                     syncAmbientMusic()
+                    XboxImageCache.clearMemoryCache()
+                    StreamKeepAliveService.start(getApplication(), "Loopback Self-Test")
                     appendLog("Loopback", "Greenlight WebRTC Loopback Self-Test active", LogSeverity.SUCCESS)
                 } else {
                     val err = loopbackRes.exceptionOrNull()?.message ?: "Loopback failed"
                     _uiState.update { it.copy(connectionMode = ConnectionMode.IDLE, streamErrorMessage = err) }
                     engine.stopAndRelease()
+                    StreamKeepAliveService.stop(getApplication())
                 }
             }
         }
@@ -1135,11 +1141,14 @@ class ProjectXViewModel(application: Application) : AndroidViewModel(application
                     )
                 }
                 syncAmbientMusic()
+                XboxImageCache.clearMemoryCache()
+                StreamKeepAliveService.start(getApplication(), "Loopback Self-Test")
                 appendLog("Loopback", "Started Greenlight WebRTC Loopback Self-Test (${activeSettings.targetFps.fps} FPS)", LogSeverity.SUCCESS)
             } else {
                 val err = loopbackRes.exceptionOrNull()?.message ?: "Loopback failed"
                 _uiState.update { it.copy(connectionMode = ConnectionMode.IDLE, streamErrorMessage = err) }
                 engine.stopAndRelease()
+                StreamKeepAliveService.stop(getApplication())
             }
         }
     }
@@ -1149,6 +1158,7 @@ class ProjectXViewModel(application: Application) : AndroidViewModel(application
         keepaliveJob = null
         activeRtcEngine?.stopAndRelease()
         activeRtcEngine = null
+        StreamKeepAliveService.stop(getApplication())
         currentGamepadState = GamepadState()
         _uiState.update {
             it.copy(
@@ -1515,8 +1525,18 @@ class ProjectXViewModel(application: Application) : AndroidViewModel(application
         configPrefs.edit().putString("achievements_$acctKey", arr.toString()).apply()
     }
 
+    fun onLowMemoryTrim() {
+        XboxImageCache.clearMemoryCache()
+        _uiState.update { state ->
+            if (state.logs.size > 20) state.copy(logs = state.logs.takeLast(20)) else state
+        }
+    }
+
     override fun onCleared() {
         super.onCleared()
+        StreamKeepAliveService.stop(getApplication())
+        activeRtcEngine?.stopAndRelease()
+        activeRtcEngine = null
         ambientPlayer.stopAndRelease()
         physicalHandler.unregisterListener()
     }

@@ -5,9 +5,11 @@ import android.graphics.Typeface
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.CornerRadius
@@ -17,7 +19,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.PointerId
+import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.ui.input.pointer.pointerInput
 import com.example.model.GamepadState
 import kotlin.math.abs
@@ -57,6 +61,15 @@ fun VirtualControllerOverlay(
 
     var activeState by remember { mutableStateOf(GamepadState()) }
     val pointerLocks = remember { mutableMapOf<PointerId, PadZone>() }
+    val latestOnStateChanged by rememberUpdatedState(onStateChanged)
+
+    DisposableEffect(Unit) {
+        onDispose {
+            pointerLocks.clear()
+            activeState = GamepadState()
+            latestOnStateChanged(GamepadState())
+        }
+    }
 
     val labelPaint = remember(cleanOpacity) {
         Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -77,9 +90,14 @@ fun VirtualControllerOverlay(
                         val h = size.height.toFloat()
                         val geometry = VirtualPadGeometry(w, h, cleanScale)
 
+                        if (event.type == PointerEventType.Exit) {
+                            continue
+                        }
+
                         val pressedPositions = mutableMapOf<PointerId, Offset>()
                         event.changes.forEach { change ->
-                            if (change.pressed) {
+                            val stillPressed = change.pressed && !change.changedToUpIgnoreConsumed()
+                            if (stillPressed) {
                                 pressedPositions[change.id] = change.position
                                 change.consume()
                             } else {
@@ -107,7 +125,7 @@ fun VirtualControllerOverlay(
                         )
                         if (newState != activeState) {
                             activeState = newState
-                            onStateChanged(newState)
+                            latestOnStateChanged(newState)
                         }
                     }
                 }
@@ -357,10 +375,14 @@ private fun computeLockedGamepadState(
             PadZone.DPAD -> {
                 val ddx = pos.x - geometry.dpadCenter.x
                 val ddy = pos.y - geometry.dpadCenter.y
-                if (abs(ddx) > abs(ddy)) {
-                    mask = mask or if (ddx < 0) GamepadState.BTN_DPAD_LEFT else GamepadState.BTN_DPAD_RIGHT
-                } else {
-                    mask = mask or if (ddy < 0) GamepadState.BTN_DPAD_UP else GamepadState.BTN_DPAD_DOWN
+                val dist = hypot(ddx, ddy)
+                if (dist > geometry.dpadRadius * 0.14f) {
+                    if (abs(ddx) > abs(ddy) * 0.42f) {
+                        mask = mask or if (ddx < 0f) GamepadState.BTN_DPAD_LEFT else GamepadState.BTN_DPAD_RIGHT
+                    }
+                    if (abs(ddy) > abs(ddx) * 0.42f) {
+                        mask = mask or if (ddy < 0f) GamepadState.BTN_DPAD_UP else GamepadState.BTN_DPAD_DOWN
+                    }
                 }
             }
             PadZone.BTN_A -> mask = mask or GamepadState.BTN_A

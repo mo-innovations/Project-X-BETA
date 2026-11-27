@@ -1,5 +1,6 @@
 package com.example
 
+import android.content.ComponentCallbacks2
 import android.os.Bundle
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -16,6 +17,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.network.XboxImageCache
 import com.example.ui.components.XboxIntroSplash
 import com.example.ui.dashboard.XboxDashboardScreen
 import com.example.ui.setup.SetupOnboardingScreen
@@ -161,6 +163,21 @@ class MainActivity : ComponentActivity() {
     override fun onPause() {
         super.onPause()
         viewModel.setAppInForeground(false)
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
+            XboxImageCache.trimMemory(level)
+        }
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND) {
+            viewModel.onLowMemoryTrim()
+        }
+    }
+
+    override fun onLowMemory() {
+        super.onLowMemory()
+        viewModel.onLowMemoryTrim()
     }
 
     override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {

@@ -21,9 +21,9 @@ import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import org.webrtc.AudioTrack
 import org.webrtc.DataChannel
-import org.webrtc.DefaultVideoDecoderFactory
-import org.webrtc.DefaultVideoEncoderFactory
 import org.webrtc.EglBase
+import org.webrtc.HardwareVideoDecoderFactory
+import org.webrtc.DefaultVideoEncoderFactory
 import org.webrtc.IceCandidate
 import org.webrtc.JavaI420Buffer
 import org.webrtc.MediaConstraints
@@ -36,14 +36,22 @@ import org.webrtc.RtpReceiver
 import org.webrtc.RtpTransceiver
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
+import org.webrtc.SoftwareVideoDecoderFactory
 import org.webrtc.SurfaceViewRenderer
+import org.webrtc.VideoCodecInfo
+import org.webrtc.VideoDecoder
+import org.webrtc.VideoDecoderFactory
 import org.webrtc.VideoFrame
 import org.webrtc.VideoSource
 import org.webrtc.VideoTrack
 import org.webrtc.audio.JavaAudioDeviceModule
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.Collections
+import java.util.IdentityHashMap
 import java.util.UUID
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
@@ -72,8 +80,12 @@ class XHomeWebRtcEngine(
 
     private val eglBase: EglBase = EglBase.create()
     private val inputExecutor = Executors.newSingleThreadExecutor()
+    private val reusableInputBuffer: ByteBuffer =
+        ByteBuffer.allocateDirect(GamepadInputEngine.BINARY_FRAME_SIZE).order(ByteOrder.LITTLE_ENDIAN)
+    private val statsInFlight = AtomicBoolean(false)
     private val isDisposed = AtomicBoolean(false)
     private val isClosing = AtomicBoolean(false)
+    private val releasedRenderers = Collections.newSetFromMap(IdentityHashMap<SurfaceViewRenderer, Boolean>())
 
     private val audioDeviceModule: JavaAudioDeviceModule
     private val peerFactory: PeerConnectionFactory
@@ -156,14 +168,38 @@ class XHomeWebRtcEngine(
         peerFactory = PeerConnectionFactory.builder()
             .setOptions(options)
             .setAudioDeviceModule(audioDeviceModule)
-            .setVideoDecoderFactory(DefaultVideoDecoderFactory(eglBase.eglBaseContext))
+            .setVideoDecoderFactory(createHardwarePrioritizedDecoderFactory(eglBase.eglBaseContext))
             .setVideoEncoderFactory(DefaultVideoEncoderFactory(eglBase.eglBaseContext, true, true))
             .createPeerConnectionFactory()
     }
 
+    private fun createHardwarePrioritizedDecoderFactory(eglContext: EglBase.Context): VideoDecoderFactory {
+        val hardwareFactory = HardwareVideoDecoderFactory(eglContext)
+        val softwareFactory = SoftwareVideoDecoderFactory()
+        return object : VideoDecoderFactory {
+            override fun createDecoder(codecInfo: VideoCodecInfo): VideoDecoder? {
+                return hardwareFactory.createDecoder(codecInfo) ?: softwareFactory.createDecoder(codecInfo)
+            }
+
+            override fun getSupportedCodecs(): Array<VideoCodecInfo> {
+                val hwH264 = hardwareFactory.supportedCodecs.filter {
+                    it.name.equals("H264", ignoreCase = true)
+                }
+                val hwOther = hardwareFactory.supportedCodecs.filterNot {
+                    it.name.equals("H264", ignoreCase = true)
+                }
+                val swFallback = softwareFactory.supportedCodecs.filter {
+                    it.name.equals("H264", ignoreCase = true)
+                }
+                return (hwH264 + hwOther + swFallback).distinctBy { "${it.name}:${it.params}" }.toTypedArray()
+            }
+        }
+    }
+
     fun attachSurfaceRenderer(renderer: SurfaceViewRenderer, aspectRatio: StreamAspectRatio) {
-        if (isDisposed.get()) return
+        if (isDisposed.get() || isClosing.get()) return
         synchronized(this) {
+            if (isDisposed.get() || isClosing.get()) return
             if (attachedRenderer !== renderer) {
                 runCatching { renderer.init(eglBase.eglBaseContext, null) }
                 renderer.setEnableHardwareScaler(true)
@@ -185,7 +221,9 @@ class XHomeWebRtcEngine(
             if (attachedRenderer === renderer) {
                 attachedRenderer = null
             }
-            runCatching { renderer.release() }
+            if (releasedRenderers.add(renderer)) {
+                runCatching { renderer.release() }
+            }
         }
     }
 
@@ -654,34 +692,50 @@ class XHomeWebRtcEngine(
     }
 
     private fun sendBinaryGamepadReport(channel: DataChannel, state: GamepadState) {
+        if (isDisposed.get() || isClosing.get() || inputExecutor.isShutdown) return
         lastSubmittedPadState = state
-        val frame = GamepadInputEngine.encodeBinaryFrame(
-            state = state,
-            sequence = inputSequence.getAndIncrement(),
-            timestampMs = System.currentTimeMillis().toDouble(),
-            reportPhysical = isPhysicalPadActive || true
-        )
-        sendBinaryBuffer(channel, frame)
+        val seq = inputSequence.getAndIncrement()
+        val ts = System.currentTimeMillis().toDouble()
+        runCatching {
+            inputExecutor.execute {
+                if (!isDisposed.get() && !isClosing.get() && channel.state() == DataChannel.State.OPEN) {
+                    runCatching {
+                        GamepadInputEngine.encodeBinaryFrameInto(
+                            target = reusableInputBuffer,
+                            state = state,
+                            sequence = seq,
+                            timestampMs = ts,
+                            reportPhysical = isPhysicalPadActive || true
+                        )
+                        channel.send(DataChannel.Buffer(reusableInputBuffer, true))
+                    }
+                }
+            }
+        }
     }
 
     private fun sendTextMessage(channel: DataChannel, json: String) {
-        if (isDisposed.get() || isClosing.get()) return
-        inputExecutor.execute {
-            if (!isDisposed.get() && !isClosing.get() && channel.state() == DataChannel.State.OPEN) {
-                runCatching {
-                    val bytes = json.toByteArray(Charsets.UTF_8)
-                    channel.send(DataChannel.Buffer(ByteBuffer.wrap(bytes), false))
+        if (isDisposed.get() || isClosing.get() || inputExecutor.isShutdown) return
+        runCatching {
+            inputExecutor.execute {
+                if (!isDisposed.get() && !isClosing.get() && channel.state() == DataChannel.State.OPEN) {
+                    runCatching {
+                        val bytes = json.toByteArray(Charsets.UTF_8)
+                        channel.send(DataChannel.Buffer(ByteBuffer.wrap(bytes), false))
+                    }
                 }
             }
         }
     }
 
     private fun sendBinaryBuffer(channel: DataChannel, bytes: ByteArray) {
-        if (isDisposed.get() || isClosing.get()) return
-        inputExecutor.execute {
-            if (!isDisposed.get() && !isClosing.get() && channel.state() == DataChannel.State.OPEN) {
-                runCatching {
-                    channel.send(DataChannel.Buffer(ByteBuffer.wrap(bytes), true))
+        if (isDisposed.get() || isClosing.get() || inputExecutor.isShutdown) return
+        runCatching {
+            inputExecutor.execute {
+                if (!isDisposed.get() && !isClosing.get() && channel.state() == DataChannel.State.OPEN) {
+                    runCatching {
+                        channel.send(DataChannel.Buffer(ByteBuffer.wrap(bytes), true))
+                    }
                 }
             }
         }
@@ -748,106 +802,114 @@ class XHomeWebRtcEngine(
             while (isActive && !isDisposed.get() && !isClosing.get()) {
                 delay(1000L)
                 if (isDisposed.get() || isClosing.get()) break
+                if (!statsInFlight.compareAndSet(false, true)) continue
 
                 val snapshot = CompletableDeferred<TelemetrySnapshot>()
-                runCatching {
+                val callResult = runCatching {
                     pc.getStats { report ->
-                        var bytesReceived = 0L
-                        var framesDecoded = 0L
-                        var totalDecodeTimeSec = 0.0
-                        var sampleTimestampUs = 0.0
-                        var packetsLost = 0L
-                        var packetsReceived = 0L
-                        var jitterSec = 0.0
-                        var width = 0
-                        var height = 0
-                        var decoderImpl = "Hardware H.264"
-                        var reportedFps = 0
-                        var rttSec = 0.0
-                        var localCandId = ""
-                        val candidateTypes = mutableMapOf<String, String>()
+                        try {
+                            var bytesReceived = 0L
+                            var framesDecoded = 0L
+                            var totalDecodeTimeSec = 0.0
+                            var sampleTimestampUs = 0.0
+                            var packetsLost = 0L
+                            var packetsReceived = 0L
+                            var jitterSec = 0.0
+                            var width = 0
+                            var height = 0
+                            var decoderImpl = "Hardware H.264"
+                            var reportedFps = 0
+                            var rttSec = 0.0
+                            var localCandId = ""
+                            val candidateTypes = mutableMapOf<String, String>()
 
-                        report.statsMap.values.forEach { stat ->
-                            when (stat.type) {
-                                "inbound-rtp" -> {
-                                    val kind = (stat.members["kind"] ?: stat.members["mediaType"])?.toString()
-                                    if (kind == "video") {
-                                        bytesReceived = (stat.members["bytesReceived"] as? Number)?.toLong() ?: 0L
-                                        framesDecoded = (stat.members["framesDecoded"] as? Number)?.toLong() ?: 0L
-                                        totalDecodeTimeSec = (stat.members["totalDecodeTime"] as? Number)?.toDouble() ?: 0.0
-                                        jitterSec = (stat.members["jitter"] as? Number)?.toDouble() ?: 0.0
-                                        packetsLost = (stat.members["packetsLost"] as? Number)?.toLong() ?: 0L
-                                        packetsReceived = (stat.members["packetsReceived"] as? Number)?.toLong() ?: 0L
-                                        width = (stat.members["frameWidth"] as? Number)?.toInt() ?: 0
-                                        height = (stat.members["frameHeight"] as? Number)?.toInt() ?: 0
-                                        reportedFps = (stat.members["framesPerSecond"] as? Number)?.toInt() ?: 0
-                                        decoderImpl = stat.members["decoderImplementation"]?.toString()?.takeIf { it.isNotBlank() }
-                                            ?: "Hardware H.264"
-                                        sampleTimestampUs = stat.timestampUs
+                            report.statsMap.values.forEach { stat ->
+                                when (stat.type) {
+                                    "inbound-rtp" -> {
+                                        val kind = (stat.members["kind"] ?: stat.members["mediaType"])?.toString()
+                                        if (kind == "video") {
+                                            bytesReceived = (stat.members["bytesReceived"] as? Number)?.toLong() ?: 0L
+                                            framesDecoded = (stat.members["framesDecoded"] as? Number)?.toLong() ?: 0L
+                                            totalDecodeTimeSec = (stat.members["totalDecodeTime"] as? Number)?.toDouble() ?: 0.0
+                                            jitterSec = (stat.members["jitter"] as? Number)?.toDouble() ?: 0.0
+                                            packetsLost = (stat.members["packetsLost"] as? Number)?.toLong() ?: 0L
+                                            packetsReceived = (stat.members["packetsReceived"] as? Number)?.toLong() ?: 0L
+                                            width = (stat.members["frameWidth"] as? Number)?.toInt() ?: 0
+                                            height = (stat.members["frameHeight"] as? Number)?.toInt() ?: 0
+                                            reportedFps = (stat.members["framesPerSecond"] as? Number)?.toInt() ?: 0
+                                            decoderImpl = stat.members["decoderImplementation"]?.toString()?.takeIf { it.isNotBlank() }
+                                                ?: "Hardware H.264"
+                                            sampleTimestampUs = stat.timestampUs
+                                        }
                                     }
-                                }
-                                "candidate-pair" -> {
-                                    val nominated = stat.members["nominated"] as? Boolean == true
-                                    val stateStr = stat.members["state"]?.toString()
-                                    if (nominated || stateStr == "succeeded") {
-                                        val rtt = (stat.members["currentRoundTripTime"] as? Number)?.toDouble()
-                                        if (rtt != null && rtt > 0) rttSec = rtt
-                                        val lid = stat.members["localCandidateId"]?.toString().orEmpty()
-                                        if (lid.isNotBlank()) localCandId = lid
+                                    "candidate-pair" -> {
+                                        val nominated = stat.members["nominated"] as? Boolean == true
+                                        val stateStr = stat.members["state"]?.toString()
+                                        if (nominated || stateStr == "succeeded") {
+                                            val rtt = (stat.members["currentRoundTripTime"] as? Number)?.toDouble()
+                                            if (rtt != null && rtt > 0) rttSec = rtt
+                                            val lid = stat.members["localCandidateId"]?.toString().orEmpty()
+                                            if (lid.isNotBlank()) localCandId = lid
+                                        }
                                     }
-                                }
-                                "local-candidate" -> {
-                                    val ctype = stat.members["candidateType"]?.toString().orEmpty()
-                                    if (ctype.isNotBlank()) candidateTypes[stat.id] = ctype
+                                    "local-candidate" -> {
+                                        val ctype = stat.members["candidateType"]?.toString().orEmpty()
+                                        if (ctype.isNotBlank()) candidateTypes[stat.id] = ctype
+                                    }
                                 }
                             }
-                        }
 
-                        val dtSec = if (prevTimestampUs > 0.0 && sampleTimestampUs > prevTimestampUs) {
-                            (sampleTimestampUs - prevTimestampUs) / 1_000_000.0
-                        } else {
-                            1.0
-                        }
-                        val deltaBytes = (bytesReceived - prevBytes).coerceAtLeast(0L)
-                        val deltaFrames = (framesDecoded - prevFrames).coerceAtLeast(0L)
-                        val deltaDecodeSec = (totalDecodeTimeSec - prevDecodeTimeSec).coerceAtLeast(0.0)
+                            val dtSec = if (prevTimestampUs > 0.0 && sampleTimestampUs > prevTimestampUs) {
+                                (sampleTimestampUs - prevTimestampUs) / 1_000_000.0
+                            } else {
+                                1.0
+                            }
+                            val deltaBytes = (bytesReceived - prevBytes).coerceAtLeast(0L)
+                            val deltaFrames = (framesDecoded - prevFrames).coerceAtLeast(0L)
+                            val deltaDecodeSec = (totalDecodeTimeSec - prevDecodeTimeSec).coerceAtLeast(0.0)
 
-                        val computedFps = if (reportedFps > 0) reportedFps else (deltaFrames / dtSec).toInt()
-                        val computedBitrateKbps = ((deltaBytes * 8.0) / (dtSec * 1000.0)).toInt()
-                        val decodeMs = if (deltaFrames > 0) ((deltaDecodeSec * 1000.0) / deltaFrames).toFloat() else 0f
-                        val totalPkts = (packetsReceived + packetsLost).coerceAtLeast(1L)
-                        val lossPct = (packetsLost * 100f) / totalPkts.toFloat()
+                            val computedFps = if (reportedFps > 0) reportedFps else (deltaFrames / dtSec).toInt()
+                            val computedBitrateKbps = ((deltaBytes * 8.0) / (dtSec * 1000.0)).toInt()
+                            val decodeMs = if (deltaFrames > 0) ((deltaDecodeSec * 1000.0) / deltaFrames).toFloat() else 0f
+                            val totalPkts = (packetsReceived + packetsLost).coerceAtLeast(1L)
+                            val lossPct = (packetsLost * 100f) / totalPkts.toFloat()
 
-                        prevBytes = bytesReceived
-                        prevFrames = framesDecoded
-                        prevDecodeTimeSec = totalDecodeTimeSec
-                        prevTimestampUs = sampleTimestampUs
+                            prevBytes = bytesReceived
+                            prevFrames = framesDecoded
+                            prevDecodeTimeSec = totalDecodeTimeSec
+                            prevTimestampUs = sampleTimestampUs
 
-                        if (localCandId.isNotBlank()) {
-                            activeIceType = candidateTypes[localCandId] ?: activeIceType
-                        }
+                            if (localCandId.isNotBlank()) {
+                                activeIceType = candidateTypes[localCandId] ?: activeIceType
+                            }
 
-                        val resText = if (width > 0 && height > 0) {
-                            "${width}x${height}"
-                        } else {
-                            "${currentSettings.resolution.width}x${currentSettings.resolution.height}"
-                        }
+                            val resText = if (width > 0 && height > 0) {
+                                "${width}x${height}"
+                            } else {
+                                "${currentSettings.resolution.width}x${currentSettings.resolution.height}"
+                            }
 
-                        snapshot.complete(
-                            TelemetrySnapshot(
-                                fps = computedFps,
-                                bitrateKbps = computedBitrateKbps,
-                                jitterMs = (jitterSec * 1000.0).toFloat(),
-                                packetLossPct = lossPct.coerceIn(0f, 100f),
-                                decodeTimeMs = decodeMs,
-                                rttMs = (rttSec * 1000.0).toInt(),
-                                decoderName = decoderImpl,
-                                resolutionLabel = resText,
-                                iceCandidateType = activeIceType,
-                                inputHz = latestInputHz
+                            snapshot.complete(
+                                TelemetrySnapshot(
+                                    fps = computedFps,
+                                    bitrateKbps = computedBitrateKbps,
+                                    jitterMs = (jitterSec * 1000.0).toFloat(),
+                                    packetLossPct = lossPct.coerceIn(0f, 100f),
+                                    decodeTimeMs = decodeMs,
+                                    rttMs = (rttSec * 1000.0).toInt(),
+                                    decoderName = decoderImpl,
+                                    resolutionLabel = resText,
+                                    iceCandidateType = activeIceType,
+                                    inputHz = latestInputHz
+                                )
                             )
-                        )
+                        } finally {
+                            statsInFlight.set(false)
+                        }
                     }
+                }
+                if (callResult.isFailure) {
+                    statsInFlight.set(false)
                 }
 
                 val snap = withTimeoutOrNull(800L) { snapshot.await() }
@@ -1005,19 +1067,34 @@ class XHomeWebRtcEngine(
     fun stopAndRelease() {
         if (!isClosing.compareAndSet(false, true)) return
         statsJob?.cancel()
+        statsJob = null
         inputLoopJob?.cancel()
+        inputLoopJob = null
         loopbackGeneratorJob?.cancel()
+        loopbackGeneratorJob = null
+        statsInFlight.set(false)
 
+        // Strict release order: 1) SurfaceViewRenderer
         synchronized(this) {
             attachedRenderer?.let { renderer ->
                 runCatching { remoteVideoTrack?.removeSink(renderer) }
-                runCatching { renderer.release() }
+                if (releasedRenderers.add(renderer)) {
+                    runCatching { renderer.release() }
+                }
                 attachedRenderer = null
             }
             remoteVideoTrack = null
             remoteAudioTrack = null
         }
 
+        // Drain single-threaded input executor before closing DataChannels
+        runCatching {
+            inputExecutor.shutdown()
+            inputExecutor.awaitTermination(150L, TimeUnit.MILLISECONDS)
+            inputExecutor.shutdownNow()
+        }
+
+        // Strict release order: 2) DataChannel
         runCatching { inputChannel?.close(); inputChannel?.dispose() }
         runCatching { controlChannel?.close(); controlChannel?.dispose() }
         runCatching { messageChannel?.close(); messageChannel?.dispose() }
@@ -1027,19 +1104,22 @@ class XHomeWebRtcEngine(
         messageChannel = null
         chatChannel = null
 
+        // Strict release order: 3) PeerConnection
         runCatching { loopbackTxPeer?.close(); loopbackTxPeer?.dispose() }
         loopbackTxPeer = null
         runCatching { loopbackVideoSource?.dispose() }
         loopbackVideoSource = null
-
         runCatching { peerConnection?.close(); peerConnection?.dispose() }
         peerConnection = null
+        synchronized(gatheredLocalCandidates) {
+            gatheredLocalCandidates.clear()
+        }
 
+        // Strict release order: 4) EglBase (after PeerConnectionFactory & AudioDeviceModule)
         if (isDisposed.compareAndSet(false, true)) {
             runCatching { audioDeviceModule.release() }
             runCatching { peerFactory.dispose() }
             runCatching { eglBase.release() }
-            runCatching { inputExecutor.shutdownNow() }
         }
         enforceSpeakerAudioMode()
     }
