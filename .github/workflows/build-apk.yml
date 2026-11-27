@@ -29,7 +29,9 @@ jobs:
           yes | "$SDK_MANAGER" --licenses >/dev/null || true
 
       - name: Build Debug APK
-        run: ./gradlew assembleDebug --stacktrace
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace
 
       - name: Upload Project X Debug APK
         uses: actions/upload-artifact@v7
