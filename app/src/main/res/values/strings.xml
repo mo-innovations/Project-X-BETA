@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">Project X</string>
+    <string name="app_version">v1.1.0</string>
+    <string name="hero_title">Stream Console</string>
+    <string name="cd_start_stream">Start xHome WebRTC stream</string>
+    <string name="cd_disconnect_stream">Disconnect active stream</string>
+    <string name="cd_toggle_overlay">Toggle virtual controller overlay</string>
+    <string name="cd_send_wol">Send Wake-on-LAN packet</string>
+    <string name="cd_register_console">Register a new Xbox console</string>
+</resources>

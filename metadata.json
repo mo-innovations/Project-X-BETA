@@ -1,0 +1,6 @@
+{
+  "name": "Project X",
+  "description": "Low-latency local LAN remote play client for Xbox Series X and Xbox One X over the xHome WebRTC protocol.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
